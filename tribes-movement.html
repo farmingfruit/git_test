@@ -136,6 +136,7 @@
         WASD - Move | MOUSE - Look | SPACE - Jetpack | CLICK - Grapple | SHIFT - Ski | ESC - Pause
     </div>
 
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
     <script type="importmap">
     {
         "imports": {
@@ -147,34 +148,6 @@
 
     <script type="module">
         import * as THREE from 'three';
-        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-        import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
-
-        // Pixelation shader
-        const PixelShader = {
-            uniforms: {
-                'tDiffuse': { value: null },
-                'resolution': { value: new THREE.Vector2(320, 240) }
-            },
-            vertexShader: `
-                varying vec2 vUv;
-                void main() {
-                    vUv = uv;
-                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-                }
-            `,
-            fragmentShader: `
-                uniform sampler2D tDiffuse;
-                uniform vec2 resolution;
-                varying vec2 vUv;
-                void main() {
-                    vec2 dxy = 1.0 / resolution;
-                    vec2 coord = dxy * floor(vUv / dxy);
-                    gl_FragColor = texture2D(tDiffuse, coord);
-                }
-            `
-        };
 
         // Game state
         const state = {
@@ -220,18 +193,8 @@
 
         const renderer = new THREE.WebGLRenderer({ antialias: false });
         renderer.setSize(window.innerWidth, window.innerHeight);
-        renderer.setPixelRatio(1);
+        renderer.setPixelRatio(0.5); // Low res for retro look
         document.body.appendChild(renderer.domElement);
-
-        // Post-processing
-        const composer = new EffectComposer(renderer);
-        composer.addPass(new RenderPass(scene, camera));
-        const pixelPass = new ShaderPass(PixelShader);
-        pixelPass.uniforms.resolution.value.set(
-            Math.floor(window.innerWidth / 3),
-            Math.floor(window.innerHeight / 3)
-        );
-        composer.addPass(pixelPass);
 
         // Lighting - brighter for visibility
         const ambientLight = new THREE.AmbientLight(0x6666aa, 0.8);
@@ -357,6 +320,16 @@
         // Add a big starting tower near spawn
         addStructure(30, 30, 80, 15);
 
+        // Debug beacon - bright sphere at origin to verify rendering
+        const beaconGeo = new THREE.SphereGeometry(5, 16, 16);
+        const beaconMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+        const beacon = new THREE.Mesh(beaconGeo, beaconMat);
+        const testHeight = getHeightAt(0, 0);
+        beacon.position.set(0, testHeight + 10, 0);
+        scene.add(beacon);
+
+        console.log('Terrain height at 0,0:', testHeight);
+
         // Grapple line visual
         const grappleLineMaterial = new THREE.LineBasicMaterial({ color: 0x00ffff, linewidth: 2 });
         const grappleLineGeometry = new THREE.BufferGeometry();
@@ -372,11 +345,17 @@
         grappleTarget.visible = false;
         scene.add(grappleTarget);
 
-        // Player position - start on a hill
+        // Player position - start above terrain
         const spawnX = 0;
         const spawnZ = 0;
-        const playerPos = new THREE.Vector3(spawnX, getHeightAt(spawnX, spawnZ) + 50, spawnZ);
+        const spawnHeight = getHeightAt(spawnX, spawnZ);
+        const playerPos = new THREE.Vector3(spawnX, spawnHeight + 50, spawnZ);
         const playerHeight = 2;
+
+        // Initialize camera position
+        camera.position.copy(playerPos);
+        camera.rotation.order = 'YXZ';
+        camera.rotation.x = -0.2; // Look slightly down
 
         // Raycaster for grapple
         const raycaster = new THREE.Raycaster();
@@ -717,7 +696,7 @@
             }
             updateParticles(deltaTime);
 
-            composer.render();
+            renderer.render(scene, camera);
         }
 
         // Handle resize
@@ -725,16 +704,14 @@
             camera.aspect = window.innerWidth / window.innerHeight;
             camera.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
-            composer.setSize(window.innerWidth, window.innerHeight);
-            pixelPass.uniforms.resolution.value.set(
-                Math.floor(window.innerWidth / 3),
-                Math.floor(window.innerHeight / 3)
-            );
         });
 
         // Start
         animate();
-        console.log('Tribes Movement Prototype loaded! Click to start.');
+        console.log('Tribes Movement Prototype loaded!');
+        console.log('Player position:', playerPos.x, playerPos.y, playerPos.z);
+        console.log('Camera position:', camera.position.x, camera.position.y, camera.position.z);
+        console.log('Scene children count:', scene.children.length);
     </script>
 </body>
 </html>
