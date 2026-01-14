@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tribes Movement Prototype</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #000; }
+        canvas { display: block; image-rendering: pixelated; }
+        #hud {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            color: #0ff;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            text-shadow: 2px 2px #000;
+            pointer-events: none;
+            z-index: 100;
+        }
+        #hud div { margin: 5px 0; }
+        #crosshair {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 20px;
+            height: 20px;
+            pointer-events: none;
+            z-index: 100;
+        }
+        #crosshair::before, #crosshair::after {
+            content: '';
+            position: absolute;
+            background: #0ff;
+        }
+        #crosshair::before {
+            width: 2px;
+            height: 20px;
+            left: 9px;
+        }
+        #crosshair::after {
+            width: 20px;
+            height: 2px;
+            top: 9px;
+        }
+        #instructions {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            color: #0ff;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            text-shadow: 1px 1px #000;
+            pointer-events: none;
+            z-index: 100;
+            opacity: 0.7;
+        }
+        #jetpack-bar {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 150px;
+            height: 20px;
+            border: 2px solid #0ff;
+            z-index: 100;
+        }
+        #jetpack-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #0ff, #f0f);
+            transition: width 0.1s;
+        }
+    </style>
+</head>
+<body>
+    <div id="hud">
+        <div>SPEED: <span id="speed">0</span> km/h</div>
+        <div>ALT: <span id="altitude">0</span> m</div>
+        <div>GRAPPLE: <span id="grapple-status">READY</span></div>
+    </div>
+    <div id="crosshair"></div>
+    <div id="jetpack-bar"><div id="jetpack-fill" style="width: 100%"></div></div>
+    <div id="instructions">
+        WASD - Move | MOUSE - Look | SPACE - Jetpack | CLICK - Grapple | SHIFT - Ski
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+        // Pixelation shader
+        const PixelShader = {
+            uniforms: {
+                'tDiffuse': { value: null },
+                'resolution': { value: new THREE.Vector2(320, 240) }
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform vec2 resolution;
+                varying vec2 vUv;
+                void main() {
+                    vec2 dxy = 1.0 / resolution;
+                    vec2 coord = dxy * floor(vUv / dxy);
+                    gl_FragColor = texture2D(tDiffuse, coord);
+                }
+            `
+        };
+
+        // Game state
+        const state = {
+            keys: {},
+            mouse: { x: 0, y: 0 },
+            mouseLocked: false,
+            velocity: new THREE.Vector3(),
+            onGround: false,
+            skiing: false,
+            jetpackFuel: 100,
+            grapple: {
+                active: false,
+                point: null,
+                length: 0
+            },
+            yaw: 0,
+            pitch: 0
+        };
+
+        // Constants - TUNED FOR MAX FUN
+        const GRAVITY = 35;
+        const MOVE_SPEED = 50;
+        const AIR_CONTROL = 0.3;
+        const JETPACK_FORCE = 55;
+        const JETPACK_DRAIN = 25;
+        const JETPACK_REGEN = 15;
+        const JUMP_FORCE = 15;
+        const SKI_FRICTION = 0.001;
+        const GROUND_FRICTION = 0.92;
+        const AIR_FRICTION = 0.995;
+        const MAX_SPEED = 200;
+        const GRAPPLE_SPEED = 150;
+        const GRAPPLE_RANGE = 200;
+        const GRAPPLE_PULL = 80;
+
+        // Three.js setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a0a2e);
+        scene.fog = new THREE.FogExp2(0x1a0a2e, 0.003);
+
+        const camera = new THREE.PerspectiveCamera(90, window.innerWidth / window.innerHeight, 0.1, 2000);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(0.5); // Low res for retro look
+        document.body.appendChild(renderer.domElement);
+
+        // Post-processing
+        const composer = new EffectComposer(renderer);
+        composer.addPass(new RenderPass(scene, camera));
+        const pixelPass = new ShaderPass(PixelShader);
+        pixelPass.uniforms.resolution.value.set(
+            window.innerWidth / 4,
+            window.innerHeight / 4
+        );
+        composer.addPass(pixelPass);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0x404060, 0.5);
+        scene.add(ambientLight);
+
+        const sunLight = new THREE.DirectionalLight(0xffaa44, 1.2);
+        sunLight.position.set(100, 200, 50);
+        scene.add(sunLight);
+
+        const fillLight = new THREE.DirectionalLight(0x4444ff, 0.3);
+        fillLight.position.set(-50, 50, -50);
+        scene.add(fillLight);
+
+        // Terrain generation
+        const terrainSize = 1000;
+        const terrainSegments = 100;
+        const terrainGeometry = new THREE.PlaneGeometry(terrainSize, terrainSize, terrainSegments, terrainSegments);
+
+        // Generate heightmap with hills and valleys for skiing
+        const vertices = terrainGeometry.attributes.position.array;
+        const heightData = [];
+
+        for (let i = 0; i < vertices.length; i += 3) {
+            const x = vertices[i];
+            const y = vertices[i + 1];
+
+            // Multiple octaves of noise for interesting terrain
+            let height = 0;
+            height += Math.sin(x * 0.01) * Math.cos(y * 0.01) * 40;
+            height += Math.sin(x * 0.02 + 1) * Math.cos(y * 0.025) * 25;
+            height += Math.sin(x * 0.005) * Math.cos(y * 0.005) * 60;
+            height += Math.sin(x * 0.04) * Math.sin(y * 0.04) * 10;
+
+            // Add some big hills/mountains
+            const distFromCenter = Math.sqrt(x * x + y * y);
+            height += Math.sin(distFromCenter * 0.02) * 30;
+
+            // Create some ramps
+            if (Math.abs(x - 100) < 50 && Math.abs(y) < 100) {
+                height += (50 - Math.abs(x - 100)) * 0.8;
+            }
+            if (Math.abs(x + 150) < 40 && Math.abs(y - 50) < 80) {
+                height += (40 - Math.abs(x + 150)) * 1.0;
+            }
+
+            vertices[i + 2] = height;
+            heightData.push({ x: vertices[i], y: vertices[i + 1], z: height });
+        }
+
+        terrainGeometry.attributes.position.needsUpdate = true;
+        terrainGeometry.computeVertexNormals();
+        terrainGeometry.rotateX(-Math.PI / 2);
+
+        // Terrain material - low poly look
+        const terrainMaterial = new THREE.MeshLambertMaterial({
+            color: 0x2d5a27,
+            flatShading: true,
+        });
+
+        const terrain = new THREE.Mesh(terrainGeometry, terrainMaterial);
+        scene.add(terrain);
+
+        // Add some structures to grapple onto
+        const structures = [];
+        const structureMaterial = new THREE.MeshLambertMaterial({ color: 0x666688, flatShading: true });
+        const accentMaterial = new THREE.MeshLambertMaterial({ color: 0xff4444, flatShading: true });
+
+        function addStructure(x, z, height, width = 10) {
+            const y = getTerrainHeight(x, z);
+            const geo = new THREE.BoxGeometry(width, height, width);
+            const mesh = new THREE.Mesh(geo, structureMaterial);
+            mesh.position.set(x, y + height / 2, z);
+            scene.add(mesh);
+            structures.push(mesh);
+
+            // Add accent on top
+            const topGeo = new THREE.BoxGeometry(width + 2, 2, width + 2);
+            const topMesh = new THREE.Mesh(topGeo, accentMaterial);
+            topMesh.position.set(x, y + height + 1, z);
+            scene.add(topMesh);
+            structures.push(topMesh);
+        }
+
+        // Scatter structures
+        for (let i = 0; i < 30; i++) {
+            const x = (Math.random() - 0.5) * 800;
+            const z = (Math.random() - 0.5) * 800;
+            const height = 30 + Math.random() * 70;
+            addStructure(x, z, height, 8 + Math.random() * 15);
+        }
+
+        // Add some floating platforms
+        const platformMaterial = new THREE.MeshLambertMaterial({ color: 0x8844aa, flatShading: true });
+        for (let i = 0; i < 20; i++) {
+            const x = (Math.random() - 0.5) * 600;
+            const z = (Math.random() - 0.5) * 600;
+            const y = 50 + Math.random() * 100;
+            const geo = new THREE.BoxGeometry(15 + Math.random() * 20, 3, 15 + Math.random() * 20);
+            const mesh = new THREE.Mesh(geo, platformMaterial);
+            mesh.position.set(x, y, z);
+            scene.add(mesh);
+            structures.push(mesh);
+        }
+
+        // Grapple line visual
+        const grappleLineMaterial = new THREE.LineBasicMaterial({ color: 0x00ffff, linewidth: 2 });
+        const grappleLineGeometry = new THREE.BufferGeometry();
+        const grappleLine = new THREE.Line(grappleLineGeometry, grappleLineMaterial);
+        grappleLine.visible = false;
+        scene.add(grappleLine);
+
+        // Grapple target indicator
+        const grappleTargetGeo = new THREE.SphereGeometry(1, 8, 8);
+        const grappleTargetMaterial = new THREE.MeshBasicMaterial({ color: 0xff00ff });
+        const grappleTarget = new THREE.Mesh(grappleTargetGeo, grappleTargetMaterial);
+        grappleTarget.visible = false;
+        scene.add(grappleTarget);
+
+        // Player position
+        const playerPos = new THREE.Vector3(0, 100, 0);
+        const playerHeight = 2;
+
+        // Raycaster for terrain and grapple
+        const raycaster = new THREE.Raycaster();
+        const downRay = new THREE.Vector3(0, -1, 0);
+
+        // Get terrain height at position
+        function getTerrainHeight(x, z) {
+            raycaster.set(new THREE.Vector3(x, 500, z), downRay);
+            const intersects = raycaster.intersectObject(terrain);
+            if (intersects.length > 0) {
+                return intersects[0].point.y;
+            }
+            return 0;
+        }
+
+        // Get terrain normal at position
+        function getTerrainNormal(x, z) {
+            raycaster.set(new THREE.Vector3(x, 500, z), downRay);
+            const intersects = raycaster.intersectObject(terrain);
+            if (intersects.length > 0) {
+                return intersects[0].face.normal.clone();
+            }
+            return new THREE.Vector3(0, 1, 0);
+        }
+
+        // Input handling
+        document.addEventListener('keydown', (e) => {
+            state.keys[e.code] = true;
+            if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+                state.skiing = true;
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            state.keys[e.code] = false;
+            if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') {
+                state.skiing = false;
+            }
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (state.mouseLocked) {
+                state.yaw -= e.movementX * 0.002;
+                state.pitch -= e.movementY * 0.002;
+                state.pitch = Math.max(-Math.PI / 2 + 0.1, Math.min(Math.PI / 2 - 0.1, state.pitch));
+            }
+        });
+
+        document.addEventListener('click', () => {
+            if (!state.mouseLocked) {
+                renderer.domElement.requestPointerLock();
+            } else {
+                shootGrapple();
+            }
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (state.grapple.active) {
+                releaseGrapple();
+            }
+        });
+
+        document.addEventListener('pointerlockchange', () => {
+            state.mouseLocked = document.pointerLockElement === renderer.domElement;
+        });
+
+        // Grapple mechanics
+        function shootGrapple() {
+            if (state.grapple.active) {
+                releaseGrapple();
+                return;
+            }
+
+            const direction = new THREE.Vector3(0, 0, -1);
+            direction.applyQuaternion(camera.quaternion);
+
+            raycaster.set(camera.position, direction);
+            raycaster.far = GRAPPLE_RANGE;
+
+            const allObjects = [terrain, ...structures];
+            const intersects = raycaster.intersectObjects(allObjects);
+
+            if (intersects.length > 0) {
+                state.grapple.active = true;
+                state.grapple.point = intersects[0].point.clone();
+                state.grapple.length = intersects[0].distance;
+                grappleLine.visible = true;
+                grappleTarget.visible = true;
+                grappleTarget.position.copy(state.grapple.point);
+            }
+        }
+
+        function releaseGrapple() {
+            state.grapple.active = false;
+            state.grapple.point = null;
+            grappleLine.visible = false;
+            grappleTarget.visible = false;
+        }
+
+        // Update grapple line visual
+        function updateGrappleLine() {
+            if (state.grapple.active && state.grapple.point) {
+                const positions = new Float32Array([
+                    playerPos.x, playerPos.y, playerPos.z,
+                    state.grapple.point.x, state.grapple.point.y, state.grapple.point.z
+                ]);
+                grappleLineGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                grappleLineGeometry.attributes.position.needsUpdate = true;
+            }
+        }
+
+        // Physics update
+        function updatePhysics(deltaTime) {
+            const dt = Math.min(deltaTime, 0.05); // Cap delta time
+
+            // Get forward and right vectors based on camera yaw only (for movement)
+            const forward = new THREE.Vector3(
+                -Math.sin(state.yaw),
+                0,
+                -Math.cos(state.yaw)
+            ).normalize();
+            const right = new THREE.Vector3(
+                Math.cos(state.yaw),
+                0,
+                -Math.sin(state.yaw)
+            ).normalize();
+
+            // Check ground collision
+            const terrainHeight = getTerrainHeight(playerPos.x, playerPos.z);
+            const terrainNormal = getTerrainNormal(playerPos.x, playerPos.z);
+            const groundLevel = terrainHeight + playerHeight;
+
+            state.onGround = playerPos.y <= groundLevel + 0.5;
+
+            // Movement input
+            let moveInput = new THREE.Vector3();
+            if (state.keys['KeyW']) moveInput.add(forward);
+            if (state.keys['KeyS']) moveInput.sub(forward);
+            if (state.keys['KeyA']) moveInput.sub(right);
+            if (state.keys['KeyD']) moveInput.add(right);
+
+            if (moveInput.length() > 0) {
+                moveInput.normalize();
+            }
+
+            // Apply movement
+            if (state.onGround) {
+                if (state.skiing) {
+                    // Skiing - only air control, minimal friction
+                    state.velocity.x += moveInput.x * MOVE_SPEED * AIR_CONTROL * dt;
+                    state.velocity.z += moveInput.z * MOVE_SPEED * AIR_CONTROL * dt;
+
+                    // Slide down slopes - this is the key skiing mechanic!
+                    const slopeForce = new THREE.Vector3(
+                        terrainNormal.x,
+                        0,
+                        terrainNormal.z
+                    );
+
+                    // Project gravity onto slope
+                    const slopeSteepness = 1 - terrainNormal.y;
+                    state.velocity.x += slopeForce.x * GRAVITY * slopeSteepness * dt * 3;
+                    state.velocity.z += slopeForce.z * GRAVITY * slopeSteepness * dt * 3;
+
+                    // Minimal friction when skiing
+                    state.velocity.x *= (1 - SKI_FRICTION);
+                    state.velocity.z *= (1 - SKI_FRICTION);
+                } else {
+                    // Normal ground movement
+                    state.velocity.x += moveInput.x * MOVE_SPEED * dt * 5;
+                    state.velocity.z += moveInput.z * MOVE_SPEED * dt * 5;
+
+                    // Ground friction
+                    state.velocity.x *= GROUND_FRICTION;
+                    state.velocity.z *= GROUND_FRICTION;
+                }
+
+                // Jump
+                if (state.keys['Space'] && !state.keys['_jumpHeld']) {
+                    state.velocity.y = JUMP_FORCE;
+                    state.onGround = false;
+                }
+            } else {
+                // Air control
+                state.velocity.x += moveInput.x * MOVE_SPEED * AIR_CONTROL * dt;
+                state.velocity.z += moveInput.z * MOVE_SPEED * AIR_CONTROL * dt;
+
+                // Air friction
+                state.velocity.x *= AIR_FRICTION;
+                state.velocity.z *= AIR_FRICTION;
+            }
+
+            state.keys['_jumpHeld'] = state.keys['Space'];
+
+            // Jetpack
+            if (state.keys['Space'] && !state.onGround && state.jetpackFuel > 0) {
+                state.velocity.y += JETPACK_FORCE * dt;
+                state.jetpackFuel -= JETPACK_DRAIN * dt;
+                state.jetpackFuel = Math.max(0, state.jetpackFuel);
+
+                // Add some particles effect later
+            } else if (state.onGround) {
+                // Regenerate fuel on ground
+                state.jetpackFuel += JETPACK_REGEN * dt;
+                state.jetpackFuel = Math.min(100, state.jetpackFuel);
+            }
+
+            // Grapple physics
+            if (state.grapple.active && state.grapple.point) {
+                const toGrapple = state.grapple.point.clone().sub(playerPos);
+                const distance = toGrapple.length();
+                const direction = toGrapple.normalize();
+
+                // Pull towards grapple point
+                state.velocity.add(direction.multiplyScalar(GRAPPLE_PULL * dt));
+
+                // Swing constraint - if beyond rope length, pull back
+                if (distance > state.grapple.length) {
+                    const excess = distance - state.grapple.length;
+                    playerPos.add(toGrapple.clone().normalize().multiplyScalar(excess * 0.5));
+                }
+
+                // Shorten rope while holding
+                state.grapple.length = Math.max(5, state.grapple.length - GRAPPLE_SPEED * dt * 0.3);
+
+                // Release if too close
+                if (distance < 5) {
+                    releaseGrapple();
+                }
+            }
+
+            // Gravity
+            if (!state.onGround) {
+                state.velocity.y -= GRAVITY * dt;
+            }
+
+            // Apply velocity
+            playerPos.add(state.velocity.clone().multiplyScalar(dt));
+
+            // Ground collision
+            if (playerPos.y < groundLevel) {
+                playerPos.y = groundLevel;
+                if (state.velocity.y < 0) {
+                    // Bounce slightly when skiing
+                    if (state.skiing && state.velocity.y < -5) {
+                        state.velocity.y *= -0.2;
+                    } else {
+                        state.velocity.y = 0;
+                    }
+                }
+                state.onGround = true;
+            }
+
+            // Speed cap
+            const horizontalSpeed = Math.sqrt(state.velocity.x ** 2 + state.velocity.z ** 2);
+            if (horizontalSpeed > MAX_SPEED) {
+                const scale = MAX_SPEED / horizontalSpeed;
+                state.velocity.x *= scale;
+                state.velocity.z *= scale;
+            }
+
+            // Update camera
+            camera.position.copy(playerPos);
+            camera.rotation.order = 'YXZ';
+            camera.rotation.y = state.yaw;
+            camera.rotation.x = state.pitch;
+
+            // Update grapple line
+            updateGrappleLine();
+        }
+
+        // HUD update
+        function updateHUD() {
+            const speed = Math.sqrt(state.velocity.x ** 2 + state.velocity.z ** 2) * 3.6; // km/h
+            document.getElementById('speed').textContent = Math.round(speed);
+            document.getElementById('altitude').textContent = Math.round(playerPos.y);
+            document.getElementById('grapple-status').textContent = state.grapple.active ? 'ATTACHED' : 'READY';
+            document.getElementById('jetpack-fill').style.width = state.jetpackFuel + '%';
+        }
+
+        // Particle system for jetpack
+        const particleGeometry = new THREE.BufferGeometry();
+        const particleCount = 100;
+        const particlePositions = new Float32Array(particleCount * 3);
+        const particleVelocities = [];
+        const particleLifetimes = [];
+
+        for (let i = 0; i < particleCount; i++) {
+            particlePositions[i * 3] = 0;
+            particlePositions[i * 3 + 1] = -1000;
+            particlePositions[i * 3 + 2] = 0;
+            particleVelocities.push(new THREE.Vector3());
+            particleLifetimes.push(0);
+        }
+
+        particleGeometry.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
+        const particleMaterial = new THREE.PointsMaterial({
+            color: 0xff6600,
+            size: 2,
+            transparent: true,
+            opacity: 0.8
+        });
+        const particles = new THREE.Points(particleGeometry, particleMaterial);
+        scene.add(particles);
+
+        let particleIndex = 0;
+
+        function spawnJetpackParticle() {
+            if (!state.keys['Space'] || state.onGround || state.jetpackFuel <= 0) return;
+
+            const i = particleIndex;
+            particleIndex = (particleIndex + 1) % particleCount;
+
+            const positions = particles.geometry.attributes.position.array;
+            positions[i * 3] = playerPos.x + (Math.random() - 0.5) * 0.5;
+            positions[i * 3 + 1] = playerPos.y - playerHeight;
+            positions[i * 3 + 2] = playerPos.z + (Math.random() - 0.5) * 0.5;
+
+            particleVelocities[i].set(
+                (Math.random() - 0.5) * 5,
+                -20 - Math.random() * 10,
+                (Math.random() - 0.5) * 5
+            );
+            particleLifetimes[i] = 0.5;
+        }
+
+        function updateParticles(dt) {
+            const positions = particles.geometry.attributes.position.array;
+
+            for (let i = 0; i < particleCount; i++) {
+                if (particleLifetimes[i] > 0) {
+                    particleLifetimes[i] -= dt;
+                    positions[i * 3] += particleVelocities[i].x * dt;
+                    positions[i * 3 + 1] += particleVelocities[i].y * dt;
+                    positions[i * 3 + 2] += particleVelocities[i].z * dt;
+                } else {
+                    positions[i * 3 + 1] = -1000;
+                }
+            }
+
+            particles.geometry.attributes.position.needsUpdate = true;
+        }
+
+        // Animation loop
+        let lastTime = performance.now();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const now = performance.now();
+            const deltaTime = (now - lastTime) / 1000;
+            lastTime = now;
+
+            updatePhysics(deltaTime);
+            updateHUD();
+
+            // Jetpack particles
+            if (state.keys['Space'] && !state.onGround && state.jetpackFuel > 0) {
+                for (let i = 0; i < 3; i++) spawnJetpackParticle();
+            }
+            updateParticles(deltaTime);
+
+            composer.render();
+        }
+
+        // Handle resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+            pixelPass.uniforms.resolution.value.set(
+                window.innerWidth / 4,
+                window.innerHeight / 4
+            );
+        });
+
+        // Start
+        animate();
+        console.log('Click to start! WASD to move, SPACE for jetpack, SHIFT to ski, CLICK to grapple');
+    </script>
+</body>
+</html>
